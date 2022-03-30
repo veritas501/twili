@@ -168,6 +168,7 @@ class GdbStub {
 	void HandleVAttach(util::Buffer &packet);
 	void HandleVContQuery(util::Buffer &packet);
 	void HandleVCont(util::Buffer &packet);
+	void HandleVFile(util::Buffer &packet);
 	
 	// get queries
 	void QueryGetSupported(util::Buffer &packet);
@@ -188,6 +189,9 @@ class GdbStub {
 	ReadOnlyStringXferObject xfer_libraries;
 	
 	bool thread_events_enabled = false;
+
+	int fake_mappings_fd = -1;
+	std::string fake_mappings_buffer;
 };
 
 } // namespace gdb

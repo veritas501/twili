@@ -51,6 +51,7 @@ GdbStub::GdbStub(ITwibDeviceInterface &itdi) :
 	AddMultiletterHandler("Attach", &GdbStub::HandleVAttach);
 	AddMultiletterHandler("Cont?", &GdbStub::HandleVContQuery);
 	AddMultiletterHandler("Cont", &GdbStub::HandleVCont);
+	AddMultiletterHandler("File", &GdbStub::HandleVFile);
 	AddXferObject("libraries", xfer_libraries);
 }
 
@@ -188,10 +189,10 @@ void GdbStub::HandleIsThreadAlive(util::Buffer &packet) {
 void GdbStub::HandleMultiletterPacket(util::Buffer &packet) {
 	std::string title;
 	char ch;
-	while(packet.Read(ch) && ch != ';') {
+	while(packet.Read(ch) && (ch != ';') && (ch != ':')) {
 		title.push_back(ch);
 	}
-	LogMessage(Debug, "got v'%s'", title.c_str());
+	LogMessage(Debug, "got v'%s'", title .c_str());
 
 	auto i = multiletter_handlers.find(title);
 	if(i != multiletter_handlers.end()) {
@@ -440,6 +441,318 @@ void GdbStub::HandleVContQuery(util::Buffer &packet) {
 	util::Buffer response;
 	response.Write(std::string("vCont;c;C"));
 	connection.Respond(response);
+}
+
+bool has_suffix(const std::string &str, const std::string &suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+void GdbStub::HandleVFile(util::Buffer &packet) {
+    util::Buffer action_buffer;
+    util::Buffer cmd_buffer;
+    char ch;
+    bool reading_action = true;
+    bool read_success = true;
+
+    struct Action {
+        enum class Type {
+            Unsupported,
+            Open,
+            Pread,
+            Close,
+            Setfs,
+        } type = Type::Unsupported;
+    };
+
+    // read action
+    while (read_success) {
+        read_success = packet.Read(ch);
+        if (!read_success) {
+            LogMessage(Warning, "Oops, malformed vFile packet");
+            connection.RespondError(1);
+            return;
+        }
+        if (ch == ':') {
+            break;
+        }
+        action_buffer.Write(ch);
+    }
+
+    Action action;
+    std::string action_str = action_buffer.GetString();
+    if (action_str.compare("open") == 0) {
+        action.type = Action::Type::Open;
+    } else if (action_str.compare("pread") == 0) {
+        action.type = Action::Type::Pread;
+    } else if (action_str.compare("close") == 0) {
+        action.type = Action::Type::Close;
+    } else if (action_str.compare("setfs") == 0) {
+        action.type = Action::Type::Setfs;
+    } else {
+        action.type = Action::Type::Unsupported;
+    }
+
+    util::Buffer arg_buffer;
+    read_success = true;
+    while (read_success) {
+        read_success = packet.Read(ch);
+        if (!read_success) {
+            break;
+        }
+        arg_buffer.Write(ch);
+    }
+
+    std::string args = arg_buffer.GetString();
+    LogMessage(Warning, "vFile action: %d", action.type);
+    LogMessage(Warning, "vFile args: %s", args.c_str());
+    int count_comma = count(args.begin(), args.end(), ',');
+    switch (action.type) {
+    case Action::Type::Open: {
+        /**
+         * vFILE:open format: filename<bytes>,flags<int>,mode<int>
+         * example: vFile:open:2f70726f632f32393439352f6d617073,0,0
+         */
+
+        if (count_comma != 2) {
+            LogMessage(Warning, "Oops, malformed vFile:open packet");
+            connection.RespondError(1);
+            return;
+        }
+        std::vector<uint8_t> open_filename_vec;
+        uint64_t open_flags;
+        uint64_t open_mode;
+        GdbConnection::DecodeWithSeparator(open_filename_vec, ',', arg_buffer);
+        GdbConnection::DecodeWithSeparator(open_flags, ',', arg_buffer);
+        GdbConnection::DecodeWithSeparator(open_mode, ',', arg_buffer);
+        std::string open_filename(open_filename_vec.begin(), open_filename_vec.end());
+
+#define SWITCH_MAP "SWITCH_MAPS"
+
+        if ((open_filename != SWITCH_MAP) &&
+            ((open_filename.find("/proc/") != 0) || !has_suffix(open_filename, "/maps"))) { // prefix check
+            LogMessage(Warning, "Not open maps, unsupported");
+            connection.RespondError(1);
+            return;
+        }
+
+        // set fake fd
+        fake_mappings_fd = 0xcc;
+
+        // return fake fd
+        {
+            util::Buffer resp_buf;
+            char resp[0x10];
+            snprintf(resp, sizeof(resp), "F%02x", fake_mappings_fd);
+            resp_buf.Write((const char *)resp);
+            connection.Respond(resp_buf);
+            return;
+        }
+
+        break;
+    }
+    case Action::Type::Pread: {
+        /**
+         * vFILE:pread format: fd<int>,len<int>,offset<int>
+         * example: vFile:pread:7,47ff,0
+         */
+        if (count_comma != 2) {
+            LogMessage(Warning, "Oops, malformed vFile:pread packet");
+            connection.RespondError(1);
+            return;
+        }
+
+        uint64_t read_fd;
+        uint64_t read_length;
+        uint64_t read_offset;
+        GdbConnection::DecodeWithSeparator(read_fd, ',', arg_buffer);
+        GdbConnection::DecodeWithSeparator(read_length, ',', arg_buffer);
+        GdbConnection::DecodeWithSeparator(read_offset, ',', arg_buffer);
+
+        if ((fake_mappings_fd == -1) || (read_fd != fake_mappings_fd)) {
+            // fake mapping not opened or open fd != mapping fd
+            util::Buffer resp_buf;
+            char resp[0x10];
+#define FILEIO_EINVAL (22)
+            snprintf(resp, sizeof(resp), "F-1,%x", FILEIO_EINVAL);
+            resp_buf.Write((const char *)resp);
+            connection.Respond(resp_buf);
+            return;
+        }
+
+        Process &p = current_thread->process;
+        if (read_offset == 0) {
+            // update mapping buffer
+            util::Buffer response;
+            fake_mappings_buffer.clear();
+
+            uint64_t query_addr = 0;
+            const uint64_t max_query_count = 10000;
+            char line_buf[0x100];
+            for (int i = 0; i < max_query_count; i++) {
+                std::tuple<nx::MemoryInfo, nx::PageInfo> ans = p.debugger.QueryMemory(query_addr);
+                nx::MemoryInfo &m_info = std::get<0>(ans);
+                query_addr = m_info.base_addr + m_info.size;
+                if (m_info.memory_type == nx::MemoryType::MemType_Unmapped) {
+                    continue;
+                }
+                if (m_info.memory_type == nx::MemoryType::MemType_Reserved) {
+                    break;
+                }
+
+                uint64_t start_addr = m_info.base_addr;
+                uint64_t end_addr = m_info.base_addr + m_info.size;
+                uint64_t perm = m_info.permission;
+                std::string mapping_name;
+                switch (m_info.memory_type) {
+                case nx::MemoryType::MemType_Io:
+                    mapping_name = "[IO]";
+                    break;
+                case nx::MemoryType::MemType_Normal:
+                    mapping_name = "[Normal]";
+                    break;
+                case nx::MemoryType::MemType_CodeStatic:
+                    mapping_name = "[CodeStatic]";
+                    break;
+                case nx::MemoryType::MemType_CodeMutable:
+                    mapping_name = "[CodeMutable]";
+                    break;
+                case nx::MemoryType::MemType_Heap:
+                    mapping_name = "[heap]";
+                    break;
+                case nx::MemoryType::MemType_SharedMem:
+                    mapping_name = "[SharedMem]";
+                    break;
+                case nx::MemoryType::MemType_WeirdSharedMem:
+                    mapping_name = "[WeirdSharedMem]";
+                    break;
+                case nx::MemoryType::MemType_ModuleCodeStatic:
+                    mapping_name = "[ModuleCodeStatic]";
+                    break;
+                case nx::MemoryType::MemType_ModuleCodeMutable:
+                    mapping_name = "[ModuleCodeMutable]";
+                    break;
+                case nx::MemoryType::MemType_IpcBuffer0:
+                    mapping_name = "[IpcBuffer0]";
+                    break;
+                case nx::MemoryType::MemType_MappedMemory:
+                    mapping_name = "[MappedMemory]";
+                    break;
+                case nx::MemoryType::MemType_ThreadLocal:
+                    mapping_name = "[ThreadLocal]";
+                    break;
+                case nx::MemoryType::MemType_TransferMemIsolated:
+                    mapping_name = "[TransferMemIsolated]";
+                    break;
+                case nx::MemoryType::MemType_TransferMem:
+                    mapping_name = "[TransferMem]";
+                    break;
+                case nx::MemoryType::MemType_ProcessMem:
+                    mapping_name = "[ProcessMem]";
+                    break;
+                case nx::MemoryType::MemType_IpcBuffer1:
+                    mapping_name = "[IpcBuffer1]";
+                    break;
+                case nx::MemoryType::MemType_IpcBuffer3:
+                    mapping_name = "[IpcBuffer3]";
+                    break;
+                case nx::MemoryType::MemType_KernelStack:
+                    mapping_name = "[KernelStack]";
+                    break;
+                case nx::MemoryType::MemType_JitReadOnly:
+                    mapping_name = "[JitReadOnly]";
+                    break;
+                case nx::MemoryType::MemType_JitWritable:
+                    mapping_name = "[JitWritable]";
+                    break;
+                default:
+                    mapping_name = "";
+                    break;
+                }
+                snprintf(line_buf, sizeof(line_buf), "%08lx-%08lx %c%c%cp 00000000 00:00 0 %s\n",
+                         start_addr, end_addr,
+                         perm & nx::Permission::Perm_R ? 'r' : '-',
+                         perm & nx::Permission::Perm_W ? 'w' : '-',
+                         perm & nx::Permission::Perm_X ? 'x' : '-',
+                         mapping_name.c_str());
+
+                fake_mappings_buffer += line_buf;
+            }
+        }
+
+        // return buffer with offset
+        ssize_t target_max_length = fake_mappings_buffer.size() - read_offset;
+        if (target_max_length <= 0) {
+            util::Buffer resp_buf;
+            resp_buf.Write("F0;");
+            connection.Respond(resp_buf);
+            return;
+        }
+        ssize_t trans_length = target_max_length > read_length - 0x20 ? read_length - 0x20 : target_max_length;
+        std::string trans_string = fake_mappings_buffer.substr(read_offset, trans_length);
+        {
+            util::Buffer resp_buf;
+            char resp[0x20];
+            snprintf(resp, sizeof(resp), "F%lx;", trans_length);
+            resp_buf.Write((const char *)resp);
+            resp_buf.Write(trans_string.c_str());
+            LogMessage(Warning, "Send -> [%s]", resp_buf.GetString().c_str());
+            connection.Respond(resp_buf);
+            return;
+        }
+        break;
+    }
+    case Action::Type::Close: {
+        /**
+         * vFILE:close format: fd<int>
+         * example: vFile:close:7
+         */
+
+        if (count_comma != 0) {
+            LogMessage(Warning, "Oops, malformed vFile:close packet");
+            connection.RespondError(1);
+            return;
+        }
+
+        uint64_t close_fd;
+        GdbConnection::DecodeWithSeparator(close_fd, ',', arg_buffer);
+        if ((fake_mappings_fd == -1) || (close_fd != fake_mappings_fd)) {
+            LogMessage(Warning, "close fail, %d %d", fake_mappings_fd, close_fd);
+            // fake mapping not opened or close fd != mapping fd
+            util::Buffer resp_buf;
+            char resp[0x10];
+#define FILEIO_EINVAL (22)
+            snprintf(resp, sizeof(resp), "F-1,%x", FILEIO_EINVAL);
+            resp_buf.Write((const char *)resp);
+            connection.Respond(resp_buf);
+            return;
+        }
+
+        // update fake fd
+        fake_mappings_fd = -1;
+
+        // return success
+        {
+            LogMessage(Warning, "close success, %x", close_fd);
+            util::Buffer resp_buf;
+            resp_buf.Write("F0");
+            connection.Respond(resp_buf);
+            return;
+        }
+        break;
+    }
+    case Action::Type::Setfs: {
+        util::Buffer resp_buf;
+        resp_buf.Write("F0");
+        connection.Respond(resp_buf);
+        return;
+    }
+    default: {
+        LogMessage(Warning, "unsupported vFile action: %s", action_str.c_str());
+        connection.RespondError(1);
+        return;
+    }
+    }
 }
 
 void GdbStub::HandleVCont(util::Buffer &packet) {

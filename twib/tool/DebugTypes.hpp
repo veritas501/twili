@@ -24,15 +24,65 @@ namespace nx {
 
 using PageInfo = uint32_t;
 
+#ifndef BIT
+#define BIT(n) (1U<<(n))
+#endif
+
+// copied from https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h
+/// Memory type enumeration (lower 8 bits of \ref MemoryState)
+typedef enum {
+    MemType_Unmapped = 0x00,            ///< Unmapped memory.
+    MemType_Io = 0x01,                  ///< Mapped by kernel capability parsing in svcCreateProcess.
+    MemType_Normal = 0x02,              ///< Mapped by kernel capability parsing in svcCreateProcess.
+    MemType_CodeStatic = 0x03,          ///< Mapped during svcCreateProcess.
+    MemType_CodeMutable = 0x04,         ///< Transition from MemType_CodeStatic performed by svcSetProcessMemoryPermission.
+    MemType_Heap = 0x05,                ///< Mapped using svcSetHeapSize.
+    MemType_SharedMem = 0x06,           ///< Mapped using svcMapSharedMemory.
+    MemType_WeirdSharedMem = 0x07,      ///< Mapped using svcMapMemory.
+    MemType_ModuleCodeStatic = 0x08,    ///< Mapped using svcMapProcessCodeMemory.
+    MemType_ModuleCodeMutable = 0x09,   ///< Transition from MemType_ModuleCodeStatic performed by svcSetProcessMemoryPermission.
+    MemType_IpcBuffer0 = 0x0A,          ///< IPC buffers with descriptor flags=0.
+    MemType_MappedMemory = 0x0B,        ///< Mapped using svcMapMemory.
+    MemType_ThreadLocal = 0x0C,         ///< Mapped during svcCreateThread.
+    MemType_TransferMemIsolated = 0x0D, ///< Mapped using svcMapTransferMemory when the owning process has perm=0.
+    MemType_TransferMem = 0x0E,         ///< Mapped using svcMapTransferMemory when the owning process has perm!=0.
+    MemType_ProcessMem = 0x0F,          ///< Mapped using svcMapProcessMemory.
+    MemType_Reserved = 0x10,            ///< Reserved.
+    MemType_IpcBuffer1 = 0x11,          ///< IPC buffers with descriptor flags=1.
+    MemType_IpcBuffer3 = 0x12,          ///< IPC buffers with descriptor flags=3.
+    MemType_KernelStack = 0x13,         ///< Mapped in kernel during svcCreateThread.
+    MemType_JitReadOnly = 0x14,         ///< Mapped in kernel during svcMapJitMemory.
+    MemType_JitWritable = 0x15,         ///< Mapped in kernel during svcMapJitMemory.
+} MemoryType;
+
+/// Memory attribute bitmasks.
+typedef enum {
+    MemAttr_IsBorrowed = BIT(0),     ///< Is borrowed memory.
+    MemAttr_IsIpcMapped = BIT(1),    ///< Is IPC mapped (when IpcRefCount > 0).
+    MemAttr_IsDeviceMapped = BIT(2), ///< Is device mapped (when DeviceRefCount > 0).
+    MemAttr_IsUncached = BIT(3),     ///< Is uncached.
+} MemoryAttribute;
+
+/// Memory permission bitmasks.
+typedef enum {
+    Perm_None = 0,             ///< No permissions.
+    Perm_R = BIT(0),           ///< Read permission.
+    Perm_W = BIT(1),           ///< Write permission.
+    Perm_X = BIT(2),           ///< Execute permission.
+    Perm_Rw = Perm_R | Perm_W, ///< Read/write permissions.
+    Perm_Rx = Perm_R | Perm_X, ///< Read/execute permissions.
+    Perm_DontCare = BIT(28),   ///< Don't care
+} Permission;
+
 struct MemoryInfo {
-	uint64_t base_addr;
-	uint64_t size;
-	uint32_t memory_type;
-	uint32_t memory_attribute;
-	uint32_t permission;
-	uint32_t device_ref_count;
-	uint32_t ipc_ref_count;
-	uint32_t padding;
+    uint64_t base_addr;        ///< Base address.
+    uint64_t size;             ///< Size.
+    uint32_t memory_type;      ///< Memory type (see lower 8 bits of \ref MemoryState).
+    uint32_t memory_attribute; ///< Memory attributes (see \ref MemoryAttribute).
+    uint32_t permission;       ///< Memory permissions (see \ref Permission).
+    uint32_t device_ref_count; ///< Device reference count.
+    uint32_t ipc_ref_count;    ///< IPC reference count.
+    uint32_t padding;          ///< Padding.
 };
 
 struct DebugEvent {

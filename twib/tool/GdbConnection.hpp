@@ -48,6 +48,7 @@ class GdbConnection {
 	static uint8_t DecodeHexByte(char *hex);
 	static uint8_t DecodeHexNybble(char hex);
 	static void DecodeWithSeparator(uint64_t &out, char sep, util::Buffer &packet);
+	static void DecodeWithSeparator(std::vector<uint8_t> &out, char sep, util::Buffer &packet);
 	static void Decode(uint64_t &out, util::Buffer &packet);
 	static void Decode(std::vector<uint8_t> &out, util::Buffer &packet);
 	static void Decode(util::Buffer &out, util::Buffer &packet);

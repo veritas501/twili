@@ -223,6 +223,25 @@ void GdbConnection::DecodeWithSeparator(uint64_t &out, char sep, util::Buffer &p
 	}
 }
 
+void GdbConnection::DecodeWithSeparator(std::vector<uint8_t> &out, char sep, util::Buffer &packet) {
+	out.reserve(packet.ReadAvailable()/2);
+	while(packet.ReadAvailable() && packet.Read()[0] != sep) {
+		uint8_t b = DecodeHexNybble(packet.Read()[0]) << 4;
+		packet.MarkRead(1); // consume
+		if(!packet.ReadAvailable()) {
+			LogMessage(Error, "unexpectedly odd number of nybbles");
+			return;
+		}
+		b|= DecodeHexNybble(packet.Read()[0]);
+		packet.MarkRead(1); // consume
+
+		out.push_back(b);
+	}
+	if(packet.ReadAvailable()) {
+		packet.MarkRead(1); // consume separator
+	}
+}
+
 void GdbConnection::Decode(uint64_t &out, util::Buffer &packet) {
 	out = 0;
 	while(packet.ReadAvailable()) {
